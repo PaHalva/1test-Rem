@@ -1,18 +1,18 @@
 # ============================================================
-# Remanga AutoBattle Telegram Bot — single file
+# Remanga AutoBattle Telegram Bot — single file (IPv4 forced)
 # ============================================================
 # Локально:
 #   pip install -r requirements.txt
 #   python bot.py
 #
 # На PaaS (relaxdev и т.п.):
-#   Задайте ENV-переменные: BOT_TOKEN, FERNET_KEY, DB_PATH, PORT
-#   Платформа сама поднимет контейнер и будет стучаться на PORT
+#   Задайте ENV: BOT_TOKEN, FERNET_KEY, DB_PATH, PORT
 # ============================================================
 
 import asyncio
 import logging
 import os
+import socket
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -22,40 +22,31 @@ import aiosqlite
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiohttp import web
+from aiohttp import ClientSession, TCPConnector, web
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 
 # ============================================================
-# 1. ЗАГРУЗКА КОНФИГА
+# 1. КОНФИГ
 # ============================================================
 
-# Сначала .env рядом с bot.py (для локальной разработки),
-# ENV контейнера имеет приоритет — load_dotenv не перезаписывает
-# уже установленные переменные.
 _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path, override=False)
 else:
-    # Пробуем CWD на случай запуска из другого места
     load_dotenv(override=False)
-
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("remanga-bot")
-
 
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "").strip()
 FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
@@ -66,7 +57,7 @@ if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не задан.\n"
         "• Локально: создайте .env с BOT_TOKEN=... рядом с bot.py\n"
-        "• На PaaS: добавьте переменную окружения BOT_TOKEN в панели"
+        "• На PaaS: добавьте переменную окружения BOT_TOKEN"
     )
 if not FERNET_KEY:
     raise RuntimeError(
@@ -79,12 +70,7 @@ try:
 except Exception as e:
     raise RuntimeError(f"FERNET_KEY некорректен: {e}")
 
-# Гарантируем, что папка для БД существует
-_db_parent = Path(DB_PATH).resolve().parent
-_db_parent.mkdir(parents=True, exist_ok=True)
-
-
-# --- Прочие настройки ---
+Path(DB_PATH).resolve().parent.mkdir(parents=True, exist_ok=True)
 
 API_DOMAIN = "https://api.remanga.org"
 USER_AGENT = (
@@ -213,8 +199,6 @@ class RemangaClient:
     def _h(self):
         return {"Authorization": self.token} if self.token else {}
 
-    # ---------- AUTH ----------
-
     @staticmethod
     async def login(login: str, password: str) -> str:
         async with httpx.AsyncClient(timeout=20) as c:
@@ -236,8 +220,6 @@ class RemangaClient:
             if r.status_code in (400, 401, 403):
                 raise RemangaAuthError(f"Неверный логин/пароль (HTTP {r.status_code})")
             raise RemangaAuthError(f"Ошибка входа: HTTP {r.status_code}")
-
-    # ---------- CORE ----------
 
     async def _get(self, path: str):
         try:
@@ -267,8 +249,6 @@ class RemangaClient:
         except httpx.HTTPError as e:
             return 0, {"_error": str(e)}
 
-    # ---------- BATTLE ----------
-
     async def profile(self):
         return await self._get("/api/v2/events/card-battle/profile/")
 
@@ -277,8 +257,6 @@ class RemangaClient:
 
     async def pvp(self):
         return await self._post("/api/v2/events/card-battle/pvp/match/")
-
-    # ---------- CATACOMBS ----------
 
     async def cata_state(self):
         return await self._get("/api/v2/events/card-battle/catacombs/state/")
@@ -439,8 +417,6 @@ class AutoBattler:
             await self.notify(f"🏺 Катакомбы: ярус {lvl} ({stars}★) — {kind or 'ok'}")
 
 
-# ---------- реестр батлеров ----------
-
 _battlers: dict[int, AutoBattler] = {}
 
 
@@ -543,7 +519,7 @@ async def cmd_login(m: Message, command: CommandObject):
     await save_token(m.chat.id, token)
 
     with suppress(Exception):
-        await m.delete()  # удалить сообщение с паролем
+        await m.delete()
 
     await msg.edit_text(
         "✅ Аккаунт привязан (пароль зашифрован).\nУправление:",
@@ -644,7 +620,7 @@ async def cb_toggle(cq: CallbackQuery):
     await update_flag(cq.from_user.id, field, new_val)
 
     if get_battler(cq.from_user.id):
-        await stop_battler(cq.from_user.id)  # потребуется ручной /start
+        await stop_battler(cq.from_user.id)
 
     u = await get_user(cq.from_user.id)
     await cq.message.edit_text("⚙️ Настройки:", reply_markup=settings_kb(u))
@@ -679,7 +655,7 @@ async def cb_logout(cq: CallbackQuery):
 
 
 # ============================================================
-# 6. HEALTH-СЕРВЕР (для PaaS — чтобы контейнер слушал PORT)
+# 6. HEALTH-СЕРВЕР
 # ============================================================
 
 async def _health_handler(_request: web.Request) -> web.Response:
@@ -703,17 +679,38 @@ async def start_health_server() -> web.AppRunner:
 # 7. ЗАПУСК
 # ============================================================
 
+def make_bot() -> Bot:
+    """
+    Создаёт Bot с принудительным IPv4 и увеличенными таймаутами.
+    Исправляет TelegramNetworkError: Request timeout error
+    на серверах с кривым IPv6-маршрутом к api.telegram.org.
+    """
+    connector = TCPConnector(family=socket.AF_INET)  # только IPv4
+    session = AiohttpSession()
+    session._connector = connector
+    # Увеличиваем таймауты (в секундах)
+    session._connector_limit = 100
+    session._connector_limit_per_host = 20
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=session,
+        timeout=120,  # таймаут на запросы к Telegram API
+    )
+    return bot
+
+
 async def main():
     await init_db()
 
-    # Поднимаем HTTP-сервер для PaaS (Traefik / health checks)
     health_runner = await start_health_server()
 
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = make_bot()
     dp = Dispatcher()
     dp.include_router(router)
 
-    log.info("Bot polling started")
+    log.info("Bot polling started (forced IPv4)")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
