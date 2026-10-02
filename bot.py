@@ -180,6 +180,49 @@ class RemangaAuthError(Exception):
     pass
 
 
+def _extract_token(data, depth: int = 0):
+    """
+    Рекурсивно ищет JWT-подобный токен в ответе сервера.
+    Поддерживает: плоские поля, вложенные объекты, массивы.
+    """
+    if depth > 4 or not isinstance(data, (dict, list)):
+        return None
+
+    if isinstance(data, list):
+        for item in data:
+            t = _extract_token(item, depth + 1)
+            if t:
+                return t
+        return None
+
+    # 1. Прямые поля верхнего уровня
+    for key in (
+        "token", "access_token", "accessToken", "access",
+        "jwt", "auth_token", "authToken", "key", "id_token",
+        "bearer", "bearer_token", "bearerToken",
+    ):
+        v = data.get(key)
+        if isinstance(v, str) and len(v) > 20:
+            return v
+
+    # 2. Иногда токен завёрнут в объект user / profile / data / content
+    for wrapper in ("content", "data", "result", "user", "profile", "auth"):
+        w = data.get(wrapper)
+        if isinstance(w, (dict, list)):
+            t = _extract_token(w, depth + 1)
+            if t:
+                return t
+
+    # 3. На всякий случай — обход всех значений
+    for v in data.values():
+        if isinstance(v, (dict, list)):
+            t = _extract_token(v, depth + 1)
+            if t:
+                return t
+
+    return None
+
+
 class RemangaClient:
     def __init__(self, token: str | None = None):
         self.token = self._norm(token) if token else None
@@ -199,6 +242,8 @@ class RemangaClient:
     def _h(self):
         return {"Authorization": self.token} if self.token else {}
 
+    # ---------- AUTH ----------
+
     @staticmethod
     async def login(login: str, password: str) -> str:
         async with httpx.AsyncClient(timeout=20) as c:
@@ -211,15 +256,59 @@ class RemangaClient:
                     "Accept": "application/json",
                 },
             )
-            if r.status_code == 200:
+
+            # === ДИАГНОСТИКА: печатаем сырой ответ ===
+            log.info("LOGIN RAW: %s", r.text[:800])
+
+            if r.status_code != 200:
+                if r.status_code in (400, 401, 403):
+                    raise RemangaAuthError(
+                        f"Неверный логин/пароль (HTTP {r.status_code})"
+                    )
+                raise RemangaAuthError(
+                    f"Ошибка входа: HTTP {r.status_code} — {(r.text or '')[:200]}"
+                )
+
+            # Парсим JSON
+            try:
                 data = r.json()
-                tok = data.get("token") or data.get("access_token")
-                if not tok:
-                    raise RemangaAuthError("Сервер вернул 200 без токена.")
-                return tok
-            if r.status_code in (400, 401, 403):
-                raise RemangaAuthError(f"Неверный логин/пароль (HTTP {r.status_code})")
-            raise RemangaAuthError(f"Ошибка входа: HTTP {r.status_code}")
+            except Exception:
+                data = {}
+
+            # 1) Пытаемся вытащить токен из тела ответа (универсально)
+            token = _extract_token(data)
+
+            # 2) Фолбэк: ищем токен в Set-Cookie
+            if not token:
+                for cname in (
+                    "token", "access_token", "accessToken",
+                    "authorization", "jwt", "auth",
+                ):
+                    try:
+                        val = r.cookies.get(cname)
+                    except Exception:
+                        val = None
+                    if val and len(val) > 20:
+                        token = val
+                        break
+
+            # 3) Фолбэк: заголовок Authorization в ответе
+            if not token:
+                auth_hdr = r.headers.get("authorization") or r.headers.get("Authorization")
+                if auth_hdr and auth_hdr.lower().startswith("bearer "):
+                    token = auth_hdr[7:]
+
+            if not token:
+                # Ничего не нашли — показываем сырой ответ
+                raise RemangaAuthError(
+                    "Сервер вернул 200, но токен не найден.\n"
+                    f"Ответ: {(r.text or '')[:300]}"
+                )
+
+            log.info("LOGIN token extracted: %s...", token[:25])
+            return token
+
+    # ---------- CORE ----------
 
     async def _get(self, path: str):
         try:
@@ -249,6 +338,8 @@ class RemangaClient:
         except httpx.HTTPError as e:
             return 0, {"_error": str(e)}
 
+    # ---------- BATTLE ----------
+
     async def profile(self):
         return await self._get("/api/v2/events/card-battle/profile/")
 
@@ -257,6 +348,8 @@ class RemangaClient:
 
     async def pvp(self):
         return await self._post("/api/v2/events/card-battle/pvp/match/")
+
+    # ---------- CATACOMBS ----------
 
     async def cata_state(self):
         return await self._get("/api/v2/events/card-battle/catacombs/state/")
@@ -681,22 +774,17 @@ async def start_health_server() -> web.AppRunner:
 
 def make_bot() -> Bot:
     """
-    Создаёт Bot с принудительным IPv4 и увеличенными таймаутами.
-    Исправляет TelegramNetworkError: Request timeout error
-    на серверах с кривым IPv6-маршрутом к api.telegram.org.
+    Bot с принудительным IPv4 и увеличенным таймаутом.
     """
-    connector = TCPConnector(family=socket.AF_INET)  # только IPv4
+    connector = TCPConnector(family=socket.AF_INET)
     session = AiohttpSession()
     session._connector = connector
-    # Увеличиваем таймауты (в секундах)
-    session._connector_limit = 100
-    session._connector_limit_per_host = 20
 
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         session=session,
-        timeout=120,  # таймаут на запросы к Telegram API
+        timeout=120,
     )
     return bot
 
