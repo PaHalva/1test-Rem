@@ -3,18 +3,17 @@
 # ============================================================
 # Установка:
 #   pip install -r requirements.txt
-#
 # Локально:
-#   создайте .env, укажите BOT_TOKEN, FERNET_KEY, DATABASE_URL
+#   .env с BOT_TOKEN, FERNET_KEY, DATABASE_URL
 #   python bot.py
-#
-# На PaaS (relaxdev и т.п.):
-#   ENV: BOT_TOKEN, FERNET_KEY, PORT, DATABASE_URL (автоматически)
+# На PaaS:
+#   ENV: BOT_TOKEN, FERNET_KEY, PORT, DATABASE_URL
 # ============================================================
 
 import asyncio
 import logging
 import os
+import random
 import socket
 import time
 from contextlib import suppress
@@ -36,7 +35,7 @@ from dotenv import load_dotenv
 
 
 # ============================================================
-# 1. ЛОГИРОВАНИЕ (ставим ДО всего остального)
+# 1. ЛОГИРОВАНИЕ
 # ============================================================
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -62,33 +61,20 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PORT         = int(os.environ.get("PORT", "8080"))
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не задан.\n"
-        "• Локально: создайте .env с BOT_TOKEN=... рядом с bot.py\n"
-        "• На PaaS: добавьте переменную окружения BOT_TOKEN"
-    )
+    raise RuntimeError("BOT_TOKEN не задан")
 if not FERNET_KEY:
-    raise RuntimeError(
-        "FERNET_KEY не задан. Сгенерируйте:\n"
-        "  python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
-    )
+    raise RuntimeError("FERNET_KEY не задан")
 if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL не задан.\n"
-        "• На PaaS: обычно подставляется автоматически при создании БД\n"
-        "• Локально: postgresql://user:pass@host:5432/dbname"
-    )
+    raise RuntimeError("DATABASE_URL не задан")
 
 try:
     fernet = Fernet(FERNET_KEY.encode())
 except Exception as e:
     raise RuntimeError(f"FERNET_KEY некорректен: {e}")
 
-# asyncpg требует postgresql://, некоторые PaaS дают postgres://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-# Чистим параметры, которые ломают asyncpg при SSL=False
 for junk in (
     "?sslmode=require", "&sslmode=require",
     "?ssl=true",        "&ssl=true",
@@ -102,30 +88,52 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 )
 
-PVP_INTERVAL      = 32
-RAID_INTERVAL     = 300
-CATACOMB_INTERVAL = 65
-LOOP_SLEEP        = 5
+
+# ============================================================
+# 3. УСТОЙЧИВОСТЬ И ГЛОБАЛЬНЫЕ ОГРАНИЧЕНИЯ
+# ============================================================
+
+# Одновременных запросов к Remanga.
+REMANGA_CONCURRENCY       = 40
+REMANGA_CONCURRENCY_SLOW  = 15
+
+# PvP: базовый интервал 32 сек + jitter 0..3; при 429 → 60 сек.
+PVP_INTERVAL           = 32
+PVP_JITTER             = 3
+PVP_INTERVAL_THROTTLED = 60
+
+# Авто-торможение при 429.
+RATE_LIMIT_WINDOW    = 60
+RATE_LIMIT_THRESHOLD = 5
+
+# Интервалы основного цикла.
+RAID_INTERVAL             = 300
+STATUS_INTERVAL           = 3600
+BATTLE_LOOP_INTERVAL      = 600   # 10 минут — когда катакомбы открыты
+BATTLE_LOOP_INTERVAL_IDLE = 900   # 15 минут — когда катакомбы закрыты
+SERVER_DOWN_RETRY         = 300   # 5 минут — если Remanga лежит
+START_JITTER              = 30    # jitter при старте автобоя
+MINI_GAME_MAX_ATTEMPTS    = 3
 
 RAID_ENERGY_COST = {1: 4, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12, 10: 13}
 
 # ------------------------------------------------------------
 # МАГАЗИН
 # ------------------------------------------------------------
-SHOP_AWAKENING_ENERGY_ID = 6333    # 35 points = 1★ (не используется: автопокупка выкл.)
+SHOP_AWAKENING_ENERGY_ID = 6333   # 35 points = 1★
 SHOP_COST_EVENT_POINTS   = 35
-FORBIDDEN_SHOP_IDS = {6332}        # restore-energy — НИКОГДА
+FORBIDDEN_SHOP_IDS = {6332}       # restore-energy — НИКОГДА
 
-# Потолок фарма звёзд рейдами. Больше — не копим.
-MAX_STARS_FOR_RAID = 6
+# Потолок автопокупки звёзд.
+MAX_STARS_AUTO_BUY = 10
 
 # ------------------------------------------------------------
 # КАТАКОМБЫ: ОКНО И ЛИМИТ (МСК)
 # ------------------------------------------------------------
 MSK = timezone(timedelta(hours=3))
-CATA_WINDOW_START_HOUR = 3     # 03:00 МСК
-CATA_WINDOW_END_HOUR   = 23    # 23:00 МСК
-CATA_RESURRECT_LIMIT   = 3     # дефолт, но реально берём из state.scrolls
+CATA_WINDOW_START_HOUR = 3
+CATA_WINDOW_END_HOUR   = 23
+CATA_RESURRECT_LIMIT   = 3
 
 
 def msk_now() -> datetime:
@@ -145,8 +153,94 @@ def msk_seconds_to_window_start() -> int:
     return int((target - now).total_seconds())
 
 
+# ------------------------------------------------------------
+# Динамический семафор
+# ------------------------------------------------------------
+
+class DynamicSemaphore:
+    """Семафор с возможностью менять лимит на лету."""
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._current = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    async def set_limit(self, new_limit: int):
+        async with self._cond:
+            self._limit = max(1, new_limit)
+            self._cond.notify_all()
+
+    async def __aenter__(self):
+        async with self._cond:
+            while self._current >= self._limit:
+                await self._cond.wait()
+            self._current += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        async with self._cond:
+            self._current -= 1
+            self._cond.notify()
+
+
+_remanga_sem = DynamicSemaphore(REMANGA_CONCURRENCY)
+
+# --- Трекер 429 ---
+_rate_limit_times: list[float] = []
+_rate_limit_throttled_until: float = 0.0
+
+
+def _record_429():
+    now = time.time()
+    _rate_limit_times.append(now)
+    cutoff = now - RATE_LIMIT_WINDOW
+    while _rate_limit_times and _rate_limit_times[0] < cutoff:
+        _rate_limit_times.pop(0)
+
+
+def _is_throttled() -> bool:
+    return time.time() < _rate_limit_throttled_until
+
+
+async def _maybe_throttle_or_unthrottle():
+    global _rate_limit_throttled_until
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW
+    recent = [t for t in _rate_limit_times if t >= cutoff]
+
+    if len(recent) >= RATE_LIMIT_THRESHOLD and not _is_throttled():
+        _rate_limit_throttled_until = now + 300
+        await _remanga_sem.set_limit(REMANGA_CONCURRENCY_SLOW)
+        log.warning(
+            "Rate limit detected (%d 429 in %ds). Throttling for 5 min: "
+            "concurrency=%d, PVP_INTERVAL=%d",
+            len(recent), RATE_LIMIT_WINDOW,
+            REMANGA_CONCURRENCY_SLOW, PVP_INTERVAL_THROTTLED,
+        )
+    elif _is_throttled() and now >= _rate_limit_throttled_until:
+        _rate_limit_throttled_until = 0
+        await _remanga_sem.set_limit(REMANGA_CONCURRENCY)
+        _rate_limit_times.clear()
+        log.info(
+            "Rate limit recovered. Restored: concurrency=%d, PVP_INTERVAL=%d",
+            REMANGA_CONCURRENCY, PVP_INTERVAL,
+        )
+
+
+async def _rate_limit_watcher():
+    while True:
+        try:
+            await _maybe_throttle_or_unthrottle()
+        except Exception:
+            log.exception("rate limit watcher error")
+        await asyncio.sleep(15)
+
+
 # ============================================================
-# 3. БАЗА ДАННЫХ (PostgreSQL через asyncpg + PgBouncer)
+# 4. БАЗА ДАННЫХ (PostgreSQL через asyncpg + PgBouncer)
 # ============================================================
 
 _pool: asyncpg.Pool | None = None
@@ -159,9 +253,9 @@ async def get_pool() -> asyncpg.Pool:
             DATABASE_URL,
             min_size=1,
             max_size=5,
-            ssl=False,                  # ваш PaaS: TLS не используется
+            ssl=False,
             command_timeout=30,
-            statement_cache_size=0,     # критично для PgBouncer
+            statement_cache_size=0,
         )
     return _pool
 
@@ -242,12 +336,23 @@ async def get_user(chat_id: int):
         row = await conn.fetchrow("SELECT * FROM users WHERE chat_id=$1", chat_id)
     if not row:
         return None
+
     d = dict(row)
+    try:
+        login = fernet.decrypt(d["login_enc"]).decode()
+        password = fernet.decrypt(d["password_enc"]).decode()
+        token = fernet.decrypt(d["token_enc"]).decode() if d.get("token_enc") else None
+    except Exception as e:
+        log.warning("Bad user record chat_id=%s, removing: %s", chat_id, e)
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM users WHERE chat_id=$1", chat_id)
+        return None
+
     return {
         "chat_id":      d["chat_id"],
-        "login":        fernet.decrypt(d["login_enc"]).decode(),
-        "password":     fernet.decrypt(d["password_enc"]).decode(),
-        "token":        fernet.decrypt(d["token_enc"]).decode() if d.get("token_enc") else None,
+        "login":        login,
+        "password":     password,
+        "token":        token,
         "raid_enabled": bool(d.get("raid_enabled", 1)),
         "pvp_enabled":  bool(d.get("pvp_enabled", 1)),
         "cata_enabled": bool(d.get("cata_enabled", 1)),
@@ -268,7 +373,6 @@ async def update_flag(chat_id: int, field: str, value):
     assert field in ALLOWED_FLAG_FIELDS, f"bad field {field}"
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # field проверен по белому списку — SQL-инъекция невозможна
         await conn.execute(
             f"UPDATE users SET {field}=$1 WHERE chat_id=$2",
             value, chat_id,
@@ -289,7 +393,7 @@ async def all_chat_ids():
 
 
 # ============================================================
-# 4. КЛИЕНТ REMANGA
+# 5. КЛИЕНТ REMANGA
 # ============================================================
 
 class RemangaAuthError(Exception):
@@ -346,8 +450,6 @@ class RemangaClient:
     def _h(self):
         return {"Authorization": self.token} if self.token else {}
 
-    # ---------- AUTH ----------
-
     @staticmethod
     async def login(login: str, password: str) -> str:
         async with httpx.AsyncClient(timeout=20) as c:
@@ -360,9 +462,7 @@ class RemangaClient:
                     "Accept": "application/json",
                 },
             )
-            # Только статус и длина — никаких токенов/логинов в логах
             log.info("LOGIN status=%s body_len=%d", r.status_code, len(r.text or ""))
-
             if r.status_code != 200:
                 if r.status_code in (400, 401, 403):
                     raise RemangaAuthError(f"Неверный логин/пароль (HTTP {r.status_code})")
@@ -390,41 +490,70 @@ class RemangaClient:
                     token = auth_hdr[7:]
             if not token:
                 raise RemangaAuthError("Сервер вернул 200, но токен не найден.")
-
             log.info("LOGIN ok, token len=%d", len(token))
             return token
 
-    # ---------- CORE ----------
+    async def _get(self, path: str, retries: int = 2):
+        async with _remanga_sem:
+            for attempt in range(retries + 1):
+                try:
+                    r = await self._c.get(
+                        f"{API_DOMAIN}{path}", headers=self._h()
+                    )
+                    if r.status_code == 401:
+                        raise RemangaAuthError("Токен истёк")
+                    if r.status_code == 429:
+                        _record_429()
+                        await asyncio.sleep(30)
+                        continue
+                    if 500 <= r.status_code < 600:
+                        log.warning("Remanga 5xx: %s %s", r.status_code, path)
+                        if attempt < retries:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return {"_server_down": True}
+                    return r.json() if r.status_code == 200 else None
+                except (httpx.HTTPError, httpx.TimeoutException) as e:
+                    log.warning("Remanga net error: %s (%s)", e, path)
+                    if attempt < retries:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    return {"_server_down": True}
+            return {"_server_down": True}
 
-    async def _get(self, path: str):
-        try:
-            r = await self._c.get(f"{API_DOMAIN}{path}", headers=self._h())
-            if r.status_code == 401:
-                raise RemangaAuthError("Токен истёк")
-            if r.status_code == 429:
-                await asyncio.sleep(30)
-                return None
-            return r.json() if r.status_code == 200 else None
-        except httpx.HTTPError:
-            return None
-
-    async def _post(self, path: str, body=None):
-        try:
-            r = await self._c.post(f"{API_DOMAIN}{path}", json=body or {}, headers=self._h())
-            if r.status_code == 401:
-                raise RemangaAuthError("Токен истёк")
-            if r.status_code == 429:
-                await asyncio.sleep(30)
-                return r.status_code, {"_rate_limited": True}
-            try:
-                data = r.json()
-            except Exception:
-                data = {"text": r.text[:200]}
-            return r.status_code, data
-        except httpx.HTTPError as e:
-            return 0, {"_error": str(e)}
-
-    # ---------- PROFILE / BATTLE ----------
+    async def _post(self, path: str, body=None, retries: int = 2):
+        async with _remanga_sem:
+            for attempt in range(retries + 1):
+                try:
+                    r = await self._c.post(
+                        f"{API_DOMAIN}{path}",
+                        json=body or {},
+                        headers=self._h(),
+                    )
+                    if r.status_code == 401:
+                        raise RemangaAuthError("Токен истёк")
+                    if r.status_code == 429:
+                        _record_429()
+                        await asyncio.sleep(30)
+                        continue
+                    if 500 <= r.status_code < 600:
+                        log.warning("Remanga 5xx POST: %s %s", r.status_code, path)
+                        if attempt < retries:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return 0, {"_server_down": True}
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {"text": r.text[:200]}
+                    return r.status_code, data
+                except (httpx.HTTPError, httpx.TimeoutException) as e:
+                    log.warning("Remanga net error POST: %s (%s)", e, path)
+                    if attempt < retries:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    return 0, {"_server_down": True}
+            return 0, {"_server_down": True}
 
     async def profile(self):
         return await self._get("/api/v2/events/card-battle/profile/")
@@ -437,8 +566,6 @@ class RemangaClient:
 
     async def pvp(self):
         return await self._post("/api/v2/events/card-battle/pvp/match/")
-
-    # ---------- CATACOMBS ----------
 
     async def cata_state(self):
         return await self._get("/api/v2/events/card-battle/catacombs/state/")
@@ -458,8 +585,6 @@ class RemangaClient:
             {"outcome": "won", "proof": {}},
         )
 
-    # ---------- SHOP ----------
-
     async def buy_shop_item(self, item_id: int, amount: int = 1):
         if item_id in FORBIDDEN_SHOP_IDS:
             log.error("BLOCKED: попытка купить запрещённый товар id=%s", item_id)
@@ -472,7 +597,7 @@ def raid_energy(loc: int) -> int:
 
 
 # ============================================================
-# 5. АВТОБОЙ
+# 6. АВТОБОЙ
 # ============================================================
 
 @dataclass
@@ -493,7 +618,9 @@ class AutoBattler:
         self.notify = notify
         self.flags = flags
         self.task: asyncio.Task | None = None
+        self.pvp_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._mini_attempts: dict[int, int] = {}
 
     async def _emit(self, text: str, important: bool = False):
         log.info("[chat=%s] %s", self.chat_id, text)
@@ -505,20 +632,82 @@ class AutoBattler:
         if self.task and not self.task.done():
             return
         self._stop.clear()
-        self.task = asyncio.create_task(self._run())
+
+        jitter = random.uniform(0, START_JITTER)
+
+        async def _delayed_start():
+            await asyncio.sleep(jitter)
+            await self._run_safe()
+
+        self.task = asyncio.create_task(_delayed_start())
+        if self.flags.pvp:
+            self.pvp_task = asyncio.create_task(self._pvp_loop())
 
     async def stop(self):
         self._stop.set()
-        if self.task:
-            self.task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.task
-            self.task = None
+        for t in (self.task, self.pvp_task):
+            if t:
+                t.cancel()
+                with suppress(asyncio.CancelledError):
+                    await t
+        self.task = None
+        self.pvp_task = None
+        self._mini_attempts.clear()
+
+    async def _run_safe(self):
+        """Обёртка: перезапускает _run при падении."""
+        while not self._stop.is_set():
+            try:
+                await self._run()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("autobattle crashed chat_id=%s", self.chat_id)
+                with suppress(Exception):
+                    await self.notify(f"⚠️ Цикл перезапустится через 30 сек: {e}")
+                await asyncio.sleep(30)
+
+    # ---------- PvP ----------
+
+    async def _pvp_loop(self):
+        cli = RemangaClient(self.token)
+        cooldown = 0
+        try:
+            while not self._stop.is_set():
+                try:
+                    if not self.flags.pvp:
+                        await asyncio.sleep(5)
+                        continue
+
+                    code, resp = await cli.pvp()
+                    if code == 200:
+                        cooldown = int(resp.get("pvp_cooldown_seconds", 0) or 0)
+                        winner = resp.get("winner") or (resp.get("battle") or {}).get("winner") or ""
+                        await self._emit(f"🏆 PvP: {winner or 'ok'}", important=False)
+                    elif code == 0:
+                        await self._emit("⚠️ PvP: сетевая ошибка", important=False)
+                        cooldown = 30
+                    else:
+                        cooldown = 30
+
+                    base = PVP_INTERVAL_THROTTLED if _is_throttled() else PVP_INTERVAL
+                    jitter = random.uniform(0, PVP_JITTER)
+                    await asyncio.sleep(max(base, cooldown) + jitter)
+
+                except RemangaAuthError:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("pvp loop error chat=%s", self.chat_id)
+                    await asyncio.sleep(60)
+        finally:
+            await cli.close()
 
     # ---------- СВИТКИ ----------
 
     async def _resurrect_done(self, cli: RemangaClient) -> bool:
-        """True, если 'resurrect' достиг дневного лимита."""
         state = await cli.cata_state() or {}
         for s in state.get("scrolls") or []:
             if isinstance(s, dict) and s.get("kind") == "resurrect":
@@ -538,13 +727,79 @@ class AutoBattler:
                 return f"{mark} Воскрешение: {used}/{limit} (в наличии {qty})"
         return "⏳ Воскрешение: нет данных"
 
-    # ---------- MAIN LOOP ----------
+    # ---------- АВТОПОКУПКА ЗВЁЗД ----------
+
+    async def _ensure_stars(self, cli: RemangaClient, need_stars: int) -> bool:
+        profile = await cli.profile()
+        if isinstance(profile, dict) and profile.get("_server_down"):
+            return False
+        profile = profile or {}
+        cur_stars = int(profile.get("awakening_energy", 0) or 0)
+        if cur_stars >= need_stars:
+            return True
+
+        if cur_stars >= MAX_STARS_AUTO_BUY:
+            await self._emit(
+                f"⛔ Звёзд {cur_stars} ≥ {MAX_STARS_AUTO_BUY} — автопокупка отключена",
+                important=False,
+            )
+            return False
+
+        missing = need_stars - cur_stars
+        max_buyable = MAX_STARS_AUTO_BUY - cur_stars
+        buy_count = min(missing, max_buyable)
+        if buy_count <= 0:
+            return False
+
+        ep = await cli.eventpoint_balance()
+        if isinstance(ep, dict) and ep.get("_server_down"):
+            return False
+        ep = ep or {}
+        cur_points = int(ep.get("balance", 0) or 0)
+        need_points = buy_count * SHOP_COST_EVENT_POINTS
+
+        if cur_points < need_points:
+            await self._emit(
+                f"⭐ Звёзд {cur_stars}/{need_stars}, points "
+                f"{cur_points}/{need_points}. Фармим рейд.",
+                important=False,
+            )
+            return False
+
+        bought = 0
+        for _ in range(buy_count):
+            profile_now = await cli.profile() or {}
+            if isinstance(profile_now, dict) and profile_now.get("_server_down"):
+                break
+            stars_now = int(profile_now.get("awakening_energy", 0) or 0)
+            if stars_now >= MAX_STARS_AUTO_BUY:
+                break
+
+            code, resp = await cli.buy_shop_item(SHOP_AWAKENING_ENERGY_ID, 1)
+            if code != 200:
+                err = resp.get("detail") or resp.get("error") or resp
+                await self._emit(f"⚠️ Покупка звезды: HTTP {code} — {err}", important=True)
+                break
+            bought += 1
+            await asyncio.sleep(1.0)
+
+        if bought > 0:
+            await self._emit(
+                f"⭐ Куплено {bought}★ за {bought * SHOP_COST_EVENT_POINTS} event points",
+                important=True,
+            )
+
+        profile_after = await cli.profile() or {}
+        if isinstance(profile_after, dict) and profile_after.get("_server_down"):
+            return False
+        return int(profile_after.get("awakening_energy", 0) or 0) >= need_stars
+
+    # ---------- ОСНОВНОЙ ЦИКЛ ----------
 
     async def _run(self):
         cli = RemangaClient(self.token)
-        last_pvp = last_raid = last_cata = 0
+        last_raid = 0
         last_status = 0
-        last_pvp_cooldown = 0
 
         cata_desc = (
             f"{self.flags.cata_level}/{self.flags.cata_stars}★"
@@ -557,6 +812,7 @@ class AutoBattler:
             f"🏆 PvP: {'вкл' if self.flags.pvp else 'выкл'}\n"
             f"🏺 Катакомбы: {'вкл' if self.flags.cata else 'выкл'} — {cata_desc}\n"
             f"📜 Охота: только Воскрешение (лимит 3/день)\n"
+            f"⭐ Автопокупка звёзд: до {MAX_STARS_AUTO_BUY}\n"
             f"🕒 Окно: 03:00–23:00 МСК",
             important=True,
         )
@@ -571,20 +827,32 @@ class AutoBattler:
 
         try:
             while not self._stop.is_set():
+                next_sleep = BATTLE_LOOP_INTERVAL
                 try:
                     now = time.time()
 
-                    profile = await cli.profile() or {}
+                    profile = await cli.profile()
+                    if isinstance(profile, dict) and profile.get("_server_down"):
+                        await self._emit(
+                            "🌐 Сервер Remanga недоступен, жду 5 минут...",
+                            important=False,
+                        )
+                        await asyncio.sleep(SERVER_DOWN_RETRY)
+                        continue
+
+                    profile = profile or {}
                     energy = int(profile.get("energy_current", 0) or 0)
                     cur_stars = int(profile.get("awakening_energy", 0) or 0)
 
-                    # сколько энергии нужно на катакомбы
                     reserve = 0
                     need_stars_cata = 0
                     if self.flags.cata and self.flags.cata_fixed:
                         levels = await get_cata_levels()
+                        if isinstance(levels, dict) and levels.get("_server_down"):
+                            await asyncio.sleep(SERVER_DOWN_RETRY)
+                            continue
                         lvl_cfg = next(
-                            (x for x in levels if x.get("level") == self.flags.cata_level),
+                            (x for x in (levels or []) if x.get("level") == self.flags.cata_level),
                             None,
                         )
                         if lvl_cfg:
@@ -597,89 +865,108 @@ class AutoBattler:
                                 .get(str(self.flags.cata_stars), 0) or 0
                             )
 
-                    # ============================================
-                    # 1. PvP — раз в 32 сек, всегда, бесплатно
-                    # ============================================
-                    if self.flags.pvp and now - last_pvp >= max(PVP_INTERVAL, last_pvp_cooldown):
-                        last_pvp = now
-                        code, resp = await cli.pvp()
-                        if code == 200:
-                            last_pvp_cooldown = int(resp.get("pvp_cooldown_seconds", 0) or 0)
-                            winner = resp.get("winner") or (resp.get("battle") or {}).get("winner") or ""
-                            await self._emit(f"🏆 PvP: {winner or 'ok'}", important=False)
-                        elif code == 0:
-                            await self._emit("⚠️ PvP: сетевая ошибка", important=False)
-                        else:
-                            last_pvp_cooldown = 30
-
-                    # ============================================
-                    # 2. Катакомбы — окно МСК, resurrect-лимит,
-                    #    энергия и звёзды
-                    # ============================================
                     in_window = msk_in_cata_window()
                     resurrect_done = True
                     if self.flags.cata:
                         resurrect_done = await self._resurrect_done(cli)
 
-                    if (
+                    cata_open = (
                         self.flags.cata
-                        and now - last_cata >= CATACOMB_INTERVAL
                         and in_window
                         and not resurrect_done
+                    )
+
+                    next_sleep = (
+                        BATTLE_LOOP_INTERVAL if cata_open
+                        else BATTLE_LOOP_INTERVAL_IDLE
+                    )
+
+                    # ---------- 1. Катакомбы ----------
+                    stars_ok = True
+                    if cata_open and cur_stars < need_stars_cata:
+                        stars_ok = await self._ensure_stars(cli, need_stars_cata)
+                        profile = await cli.profile() or {}
+                        if not isinstance(profile, dict) or not profile.get("_server_down"):
+                            cur_stars = int((profile or {}).get("awakening_energy", 0) or 0)
+
+                    if (
+                        cata_open
+                        and stars_ok
                         and energy >= reserve
                         and cur_stars >= need_stars_cata
                     ):
-                        last_cata = now
                         await self._do_cata(cli)
-                        await asyncio.sleep(LOOP_SLEEP)
+                        await asyncio.sleep(BATTLE_LOOP_INTERVAL)
                         continue
 
-                    # ============================================
-                    # 3. Рейд — только пока звёзд < 6 (потолок),
-                    #    и после рейда останется резерв под катакомбы
-                    # ============================================
+                    # ---------- 2. Рейд ----------
+                    cata_ready = (
+                        cata_open
+                        and energy >= reserve
+                        and cur_stars >= need_stars_cata
+                    )
+
                     if (
                         self.flags.raid
-                        and cur_stars < MAX_STARS_FOR_RAID
+                        and not cata_ready
                         and now - last_raid >= RAID_INTERVAL
                     ):
+                        last_raid = now
                         need_raid = raid_energy(self.flags.raid_loc)
-                        if energy - need_raid >= reserve:
-                            last_raid = now
-                            await self._do_raid(cli, self.flags.raid_loc)
-                        else:
-                            await self._emit(
-                                f"⚔️ Рейд отложен: энергии {energy}, "
-                                f"нужно {need_raid} + {reserve} резерв",
-                                important=False,
-                            )
+                        if energy >= need_raid:
+                            code, resp = await cli.raid(self.flags.raid_loc)
+                            if isinstance(resp, dict) and resp.get("_server_down"):
+                                await self._emit(
+                                    "🌐 Сервер недоступен (рейд), жду 5 минут...",
+                                    important=False,
+                                )
+                                last_raid = now - RAID_INTERVAL + 60
+                                await asyncio.sleep(SERVER_DOWN_RETRY)
+                                continue
+                            if code == 200:
+                                rewards = resp.get("rewards") or []
+                                rtxt = ", ".join(
+                                    f"{r.get('kind')} x{r.get('amount')}"
+                                    for r in rewards if isinstance(r, dict)
+                                ) if rewards else "ok"
+                                await self._emit(
+                                    f"⚔️ Рейд {self.flags.raid_loc}: {rtxt}",
+                                    important=False,
+                                )
 
-                    # ============================================
-                    # 4. Отчёт раз в час
-                    # ============================================
-                    if now - last_status >= 3600:
+                    # ---------- 3. Отчёт раз в час ----------
+                    if now - last_status >= STATUS_INTERVAL:
                         last_status = now
                         dust = int(profile.get("reroll_dust", 0) or 0)
                         rerolls = int(profile.get("full_reroll_energy", 0) or 0)
                         ep = await cli.eventpoint_balance() or {}
+                        if isinstance(ep, dict) and ep.get("_server_down"):
+                            ep = {}
                         points = int(ep.get("balance", 0) or 0)
 
                         state = await cli.cata_state() or {}
+                        if isinstance(state, dict) and state.get("_server_down"):
+                            state = {}
                         resurrect_line = self._resurrect_line_from_state(state)
 
                         if not in_window:
                             sec = msk_seconds_to_window_start()
                             hh, mm = sec // 3600, (sec % 3600) // 60
-                            cata_status = f"🕒 Вне окна, до 03:00 МСК: {hh}ч {mm}м"
+                            cata_status = f"🕒 Вне окна, до 03:00 МСК: {hh}ч {mm}м (фарм рейдами)"
                         elif resurrect_done:
-                            cata_status = "✅ Воскрешение добито — ждём 03:00 МСК"
+                            cata_status = "✅ Воскрешение добито — ждём 03:00 МСК (фарм рейдами)"
                         else:
                             cata_status = "📜 Идём за Воскрешением"
+
+                        if cur_stars >= MAX_STARS_AUTO_BUY:
+                            buy_note = f"⛔ автопокупка выкл (≥ {MAX_STARS_AUTO_BUY})"
+                        else:
+                            buy_note = f"до {MAX_STARS_AUTO_BUY}"
 
                         lines = [
                             "📊 Статус",
                             f"⚡ Энергия: {energy}/185",
-                            f"⭐ Звёзды: {cur_stars} (потолок фарма {MAX_STARS_FOR_RAID})",
+                            f"⭐ Звёзды: {cur_stars} ({buy_note})",
                             f"🎲 Рероллы: {rerolls}",
                             f"💠 Пыль: {dust}",
                             f"🎯 Event points: {points}",
@@ -697,35 +984,48 @@ class AutoBattler:
                     log.exception("autobattle error")
                     await self._emit(f"❌ Ошибка: {e}", important=True)
 
-                await asyncio.sleep(LOOP_SLEEP)
+                await asyncio.sleep(next_sleep)
         finally:
             await cli.close()
 
-    # ---------- ACTIONS ----------
-
-    async def _do_raid(self, cli: RemangaClient, loc: int):
-        code, resp = await cli.raid(loc)
-        if code == 200:
-            rewards = resp.get("rewards") or []
-            rtxt = ", ".join(
-                f"{r.get('kind')} x{r.get('amount')}"
-                for r in rewards if isinstance(r, dict)
-            ) if rewards else "ok"
-            await self._emit(f"⚔️ Рейд {loc}: {rtxt}", important=False)
-        else:
-            err = resp.get("detail") or resp.get("error") or resp
-            await self._emit(f"⚠️ Рейд {loc}: HTTP {code} — {err}", important=False)
+    # ---------- CATACOMBS ----------
 
     async def _do_cata(self, cli: RemangaClient):
-        state = await cli.cata_state() or {}
-        profile = await cli.profile() or {}
+        state = await cli.cata_state()
+        if isinstance(state, dict) and state.get("_server_down"):
+            await self._emit("🌐 Сервер недоступен (катакомбы), жду", important=False)
+            return
+        state = state or {}
 
-        # дорешать висящую мини-игру
+        profile = await cli.profile()
+        if isinstance(profile, dict) and profile.get("_server_down"):
+            return
+        profile = profile or {}
+
+        # Дорешаем висящую мини-игру с ограничением попыток
         pending = state.get("mini_game") or (state.get("current_run") or {}).get("mini_game")
         pending_id = (pending or {}).get("attempt_id") or state.get("attempt_id")
         if pending_id:
-            await cli.cata_resolve(pending_id)
-            await self._emit("🏺 Дорешана незакрытая мини-игра", important=False)
+            attempts = self._mini_attempts.get(pending_id, 0)
+            if attempts < MINI_GAME_MAX_ATTEMPTS:
+                code, resp = await cli.cata_resolve(pending_id)
+                if code == 200 and not (isinstance(resp, dict) and resp.get("_server_down")):
+                    self._mini_attempts.pop(pending_id, None)
+                    await self._emit("🏺 Дорешана незакрытая мини-игра", important=False)
+                else:
+                    self._mini_attempts[pending_id] = attempts + 1
+                    await self._emit(
+                        f"⚠️ Мини-игра {pending_id}: попытка {attempts+1}/{MINI_GAME_MAX_ATTEMPTS}",
+                        important=False,
+                    )
+            else:
+                await self._emit(
+                    f"🚫 Мини-игра {pending_id} не решается после "
+                    f"{MINI_GAME_MAX_ATTEMPTS} попыток. Пропускаю.",
+                    important=True,
+                )
+                self._mini_attempts.pop(pending_id, None)
+                return
 
         if self.flags.cata_fixed:
             lvl, stars = self.flags.cata_level, self.flags.cata_stars
@@ -740,8 +1040,10 @@ class AutoBattler:
         if not lvl:
             return
 
-        levels = await cli.cata_levels() or []
-        lvl_cfg = next((x for x in levels if x.get("level") == lvl), None)
+        levels = await cli.cata_levels()
+        if isinstance(levels, dict) and levels.get("_server_down"):
+            return
+        lvl_cfg = next((x for x in (levels or []) if x.get("level") == lvl), None)
         if not lvl_cfg:
             return
 
@@ -759,15 +1061,12 @@ class AutoBattler:
                 important=False,
             )
             return
-
         if cur_stars < need_stars:
             await self._emit(
-                f"⭐ Звёзд мало для {lvl}/{stars}★: {cur_stars}/{need_stars}. Иду фармить рейд.",
+                f"⭐ Звёзд мало для {lvl}/{stars}★: {cur_stars}/{need_stars}",
                 important=False,
             )
-            await self._do_raid(cli, self.flags.raid_loc)
             return
-
         if cur_rerolls < need_rerolls:
             await self._emit(
                 f"🎲 Рероллов мало для {lvl}/{stars}★: {cur_rerolls}/{need_rerolls}",
@@ -776,6 +1075,8 @@ class AutoBattler:
             return
 
         code, resp = await cli.cata_enter(lvl, stars)
+        if isinstance(resp, dict) and resp.get("_server_down"):
+            return
         if code != 200:
             err = resp.get("detail") or resp.get("error") or resp
             await self._emit(f"🏺 Катакомбы {lvl}/{stars}★: ошибка — {err}", important=True)
@@ -786,8 +1087,11 @@ class AutoBattler:
         if kind == "mini_game_required":
             aid = (resp.get("mini_game") or {}).get("attempt_id") or resp.get("attempt_id")
             if aid:
-                await cli.cata_resolve(aid)
-                reward_text = "мини-игра пройдена"
+                code2, resp2 = await cli.cata_resolve(aid)
+                if code2 == 200 and not (isinstance(resp2, dict) and resp2.get("_server_down")):
+                    reward_text = "мини-игра пройдена"
+                else:
+                    reward_text = "мини-игра не решена"
             else:
                 reward_text = "мини-игра без ID"
         elif kind == "run_finished":
@@ -799,8 +1103,9 @@ class AutoBattler:
         else:
             reward_text = str(kind or "ok")
 
-        # обновим state, чтобы увидеть актуальный daily_used
         new_state = await cli.cata_state() or {}
+        if isinstance(new_state, dict) and new_state.get("_server_down"):
+            new_state = {}
         resurrect_line = self._resurrect_line_from_state(new_state)
 
         await self._emit(
@@ -809,7 +1114,10 @@ class AutoBattler:
         )
 
 
+# ---------- РЕЕСТР БАТЛЕРОВ ----------
+
 _battlers: dict[int, AutoBattler] = {}
+_registry_lock = asyncio.Lock()
 
 
 def get_battler(chat_id: int) -> AutoBattler | None:
@@ -817,23 +1125,25 @@ def get_battler(chat_id: int) -> AutoBattler | None:
 
 
 async def register_battler(chat_id: int, token: str, notify, flags: Flags) -> AutoBattler:
-    old = _battlers.get(chat_id)
-    if old:
-        await old.stop()
-    b = AutoBattler(chat_id, token, notify, flags)
-    _battlers[chat_id] = b
-    await b.start()
-    return b
+    async with _registry_lock:
+        old = _battlers.get(chat_id)
+        if old:
+            await old.stop()
+        b = AutoBattler(chat_id, token, notify, flags)
+        _battlers[chat_id] = b
+        await b.start()
+        return b
 
 
 async def stop_battler(chat_id: int):
-    b = _battlers.pop(chat_id, None)
+    async with _registry_lock:
+        b = _battlers.pop(chat_id, None)
     if b:
         await b.stop()
 
 
 # ============================================================
-# 6. TELEGRAM-ХЕНДЛЕРЫ
+# 7. TELEGRAM-ХЕНДЛЕРЫ
 # ============================================================
 
 router = Router()
@@ -967,8 +1277,13 @@ async def cmd_login(m: Message, command: CommandObject):
         await msg.edit_text("❌ Ошибка соединения.")
         return
 
-    await save_user(m.chat.id, login, password)
-    await save_token(m.chat.id, token)
+    try:
+        await save_user(m.chat.id, login, password)
+        await save_token(m.chat.id, token)
+    except Exception as e:
+        log.exception("DB error during login")
+        await msg.edit_text(f"❌ Ошибка сохранения в БД: {e}")
+        return
 
     with suppress(Exception):
         await m.delete()
@@ -1037,15 +1352,27 @@ async def cb_profile(cq: CallbackQuery):
     cli = RemangaClient(u["token"])
     try:
         p = await cli.profile() or {}
+        if isinstance(p, dict) and p.get("_server_down"):
+            p = {}
         ep = await cli.eventpoint_balance() or {}
+        if isinstance(ep, dict) and ep.get("_server_down"):
+            ep = {}
         state = await cli.cata_state() or {}
+        if isinstance(state, dict) and state.get("_server_down"):
+            state = {}
     finally:
         await cli.close()
+
+    stars = int(p.get("awakening_energy", 0) or 0)
+    if stars >= MAX_STARS_AUTO_BUY:
+        buy_note = f"⛔ автопокупка выкл (≥ {MAX_STARS_AUTO_BUY})"
+    else:
+        buy_note = f"автопокупка до {MAX_STARS_AUTO_BUY}"
 
     text = (
         "👤 <b>Профиль</b>\n"
         f"⚡ Энергия: {p.get('energy_current', '?')}/{p.get('energy_max', '?')}\n"
-        f"⭐ Звёзды: {p.get('awakening_energy', '?')}\n"
+        f"⭐ Звёзды: {stars} ({buy_note})\n"
         f"🎲 Рероллы: {p.get('full_reroll_energy', '?')}\n"
         f"💠 Пыль: {p.get('reroll_dust', '?')}\n"
         f"🎯 Event points: {ep.get('balance', '?')}\n"
@@ -1076,7 +1403,6 @@ async def cb_toggle(cq: CallbackQuery):
     new_val = 0 if u[field] else 1
     await update_flag(cq.from_user.id, field, new_val)
 
-    # если автобой запущен — перезапустим с новыми флагами
     if get_battler(cq.from_user.id):
         await stop_battler(cq.from_user.id)
         u2 = await get_user(cq.from_user.id)
@@ -1199,7 +1525,7 @@ async def cb_logout(cq: CallbackQuery):
 
 
 # ============================================================
-# 7. HEALTH-СЕРВЕР
+# 8. HEALTH-СЕРВЕР
 # ============================================================
 
 async def _health_handler(_request: web.Request) -> web.Response:
@@ -1219,7 +1545,7 @@ async def start_health_server() -> web.AppRunner:
 
 
 # ============================================================
-# 8. ЗАПУСК
+# 9. ЗАПУСК
 # ============================================================
 
 def make_bot() -> Bot:
@@ -1237,6 +1563,9 @@ def make_bot() -> Bot:
 async def main():
     await init_db()
     health_runner = await start_health_server()
+
+    # Наблюдатель за 429 — авто-торможение
+    asyncio.create_task(_rate_limit_watcher())
 
     bot = make_bot()
     dp = Dispatcher()
