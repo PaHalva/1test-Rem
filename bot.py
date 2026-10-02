@@ -1,12 +1,13 @@
 # ============================================================
 # Remanga AutoBattle Telegram Bot — single file
 # ============================================================
-# Установка:
-#   pip install aiogram==3.13.1 httpx==0.27.2 aiosqlite==0.20.0 \
-#               python-dotenv==1.0.1 cryptography==43.0.1
-#
-# Запуск:
+# Локально:
+#   pip install -r requirements.txt
 #   python bot.py
+#
+# На PaaS (relaxdev и т.п.):
+#   Задайте ENV-переменные: BOT_TOKEN, FERNET_KEY, DB_PATH, PORT
+#   Платформа сама поднимет контейнер и будет стучаться на PORT
 # ============================================================
 
 import asyncio
@@ -14,7 +15,8 @@ import logging
 import os
 import time
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 import aiosqlite
 import httpx
@@ -24,31 +26,65 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 
 # ============================================================
-# 1. КОНФИГ
+# 1. ЗАГРУЗКА КОНФИГА
 # ============================================================
 
-load_dotenv()
+# Сначала .env рядом с bot.py (для локальной разработки),
+# ENV контейнера имеет приоритет — load_dotenv не перезаписывает
+# уже установленные переменные.
+_env_path = Path(__file__).resolve().parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path, override=False)
+else:
+    # Пробуем CWD на случай запуска из другого места
+    load_dotenv(override=False)
 
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "").strip()
-FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
-DB_PATH    = os.getenv("DB_PATH", "remanga_bot.db")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("remanga-bot")
+
+
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "").strip()
+FERNET_KEY = os.environ.get("FERNET_KEY", "").strip()
+DB_PATH    = os.environ.get("DB_PATH", "remanga_bot.db").strip()
+PORT       = int(os.environ.get("PORT", "8080"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан в .env")
+    raise RuntimeError(
+        "BOT_TOKEN не задан.\n"
+        "• Локально: создайте .env с BOT_TOKEN=... рядом с bot.py\n"
+        "• На PaaS: добавьте переменную окружения BOT_TOKEN в панели"
+    )
 if not FERNET_KEY:
-    raise RuntimeError("FERNET_KEY не задан в .env")
+    raise RuntimeError(
+        "FERNET_KEY не задан. Сгенерируйте:\n"
+        "  python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    )
 
-fernet = Fernet(FERNET_KEY.encode())
+try:
+    fernet = Fernet(FERNET_KEY.encode())
+except Exception as e:
+    raise RuntimeError(f"FERNET_KEY некорректен: {e}")
+
+# Гарантируем, что папка для БД существует
+_db_parent = Path(DB_PATH).resolve().parent
+_db_parent.mkdir(parents=True, exist_ok=True)
+
+
+# --- Прочие настройки ---
 
 API_DOMAIN = "https://api.remanga.org"
 USER_AGENT = (
@@ -62,12 +98,6 @@ CATACOMB_INTERVAL = 65
 LOOP_SLEEP        = 5
 
 RAID_ENERGY_COST = {1: 4, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12, 10: 13}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("remanga-bot")
 
 
 # ============================================================
@@ -93,6 +123,7 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(INIT_SQL)
         await db.commit()
+    log.info("DB ready at %s", DB_PATH)
 
 
 async def save_user(chat_id: int, login: str, password: str):
@@ -504,6 +535,9 @@ async def cmd_login(m: Message, command: CommandObject):
     except RemangaAuthError as e:
         await msg.edit_text(f"❌ Не удалось войти: {e}")
         return
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка соединения: {e}")
+        return
 
     await save_user(m.chat.id, login, password)
     await save_token(m.chat.id, token)
@@ -645,23 +679,49 @@ async def cb_logout(cq: CallbackQuery):
 
 
 # ============================================================
-# 6. ЗАПУСК
+# 6. HEALTH-СЕРВЕР (для PaaS — чтобы контейнер слушал PORT)
+# ============================================================
+
+async def _health_handler(_request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", _health_handler)
+    app.router.add_get("/health", _health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Health endpoint listening on :%d", PORT)
+    return runner
+
+
+# ============================================================
+# 7. ЗАПУСК
 # ============================================================
 
 async def main():
     await init_db()
 
+    # Поднимаем HTTP-сервер для PaaS (Traefik / health checks)
+    health_runner = await start_health_server()
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
 
-    log.info("Bot started")
+    log.info("Bot polling started")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         for cid in await all_chat_ids():
             await stop_battler(cid)
         await bot.session.close()
+        with suppress(Exception):
+            await health_runner.cleanup()
         log.info("Bot stopped")
 
 
