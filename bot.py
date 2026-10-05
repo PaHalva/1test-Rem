@@ -1,6 +1,6 @@
 # ============================================================
-# Remanga AutoBattle Telegram Bot — multi-account edition v3
-# Совместимо с Python 3.11 (без вложенных f-строк одного типа)
+# Remanga AutoBattle Telegram Bot — multi-account edition v4
+# Совместимо с Python 3.11
 # ============================================================
 
 import asyncio
@@ -30,8 +30,10 @@ from dotenv import load_dotenv
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("remanga-bot")
 
 # ---------- Конфиг ----------
@@ -48,9 +50,11 @@ fernet = Fernet(FERNET_KEY.encode())
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
-for junk in ("?sslmode=require", "&sslmode=require",
-             "?ssl=true", "&ssl=true",
-             "?channel_binding=require", "&channel_binding=require"):
+for junk in (
+    "?sslmode=require", "&sslmode=require",
+    "?ssl=true", "&ssl=true",
+    "?channel_binding=require", "&channel_binding=require",
+):
     DATABASE_URL = DATABASE_URL.replace(junk, "")
 
 MAX_ACCOUNTS_PER_USER = 10
@@ -103,12 +107,6 @@ def msk_now() -> datetime:
     return datetime.now(MSK)
 
 def msk_in_schedule(start: int, end: int) -> bool:
-    """
-    Расписание по МСК.
-    0/0 → 24/7.
-    start < end → окно [start, end).
-    start > end → окно через полночь (например, 23→3).
-    """
     if start == 0 and end == 0:
         return True
     h = msk_now().hour
@@ -127,19 +125,23 @@ class DynamicSemaphore:
         self._limit = limit
         self._current = 0
         self._cond = asyncio.Condition()
+
     @property
     def limit(self):
         return self._limit
+
     async def set_limit(self, new_limit: int):
         async with self._cond:
             self._limit = max(1, new_limit)
             self._cond.notify_all()
+
     async def __aenter__(self):
         async with self._cond:
             while self._current >= self._limit:
                 await self._cond.wait()
             self._current += 1
         return self
+
     async def __aexit__(self, *a):
         async with self._cond:
             self._current -= 1
@@ -148,8 +150,8 @@ class DynamicSemaphore:
 _remanga_sem = DynamicSemaphore(REMANGA_CONCURRENCY)
 
 # ---------- Трекер 429 ----------
-_rate_limit_times: list = []
-_rate_limit_throttled_until: float = 0.0
+_rate_limit_times = []
+_rate_limit_throttled_until = 0.0
 
 def _record_429():
     now = time.time()
@@ -169,7 +171,8 @@ async def _maybe_throttle_or_unthrottle():
     if len(recent) >= RATE_LIMIT_THRESHOLD and not _is_throttled():
         _rate_limit_throttled_until = now + 300
         await _remanga_sem.set_limit(REMANGA_CONCURRENCY_SLOW)
-        log.warning("Rate limit: %d 429 in %ds. Throttling 5 min.", len(recent), RATE_LIMIT_WINDOW)
+        log.warning("Rate limit: %d 429 in %ds. Throttling 5 min.",
+                    len(recent), RATE_LIMIT_WINDOW)
     elif _is_throttled() and now >= _rate_limit_throttled_until:
         _rate_limit_throttled_until = 0
         await _remanga_sem.set_limit(REMANGA_CONCURRENCY)
@@ -187,14 +190,18 @@ async def _rate_limit_watcher():
 # ============================================================
 # БАЗА ДАННЫХ
 # ============================================================
-_pool: asyncpg.Pool | None = None
+_pool = None
 
-async def get_pool() -> asyncpg.Pool:
+async def get_pool():
     global _pool
     if _pool is None:
         _pool = await asyncpg.create_pool(
-            DATABASE_URL, min_size=1, max_size=5, ssl=False,
-            command_timeout=30, statement_cache_size=0,
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            ssl=False,
+            command_timeout=30,
+            statement_cache_size=0,
         )
     return _pool
 
@@ -203,34 +210,6 @@ async def close_pool():
     if _pool:
         await _pool.close()
         _pool = None
-
-INIT_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    chat_id         BIGINT PRIMARY KEY,
-    notify_mode     TEXT    DEFAULT 'important',
-    schedule_start  INTEGER DEFAULT 0,
-    schedule_end    INTEGER DEFAULT 0,
-    created_at      BIGINT  DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
-);
-CREATE TABLE IF NOT EXISTS accounts (
-    id            BIGSERIAL PRIMARY KEY,
-    chat_id       BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
-    label         TEXT NOT NULL DEFAULT '',
-    login_enc     BYTEA NOT NULL,
-    password_enc  BYTEA NOT NULL,
-    token_enc     BYTEA,
-    raid_enabled  INTEGER DEFAULT 1,
-    pvp_enabled   INTEGER DEFAULT 1,
-    cata_enabled  INTEGER DEFAULT 1,
-    raid_loc      INTEGER DEFAULT 10,
-    cata_fixed    INTEGER DEFAULT 1,
-    cata_level    INTEGER DEFAULT 17,
-    cata_stars    INTEGER DEFAULT 1,
-    auto_start    INTEGER DEFAULT 0,
-    created_at    BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
-);
-CREATE INDEX IF NOT EXISTS idx_accounts_chat ON accounts(chat_id);
-"""
 
 MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_mode TEXT DEFAULT 'important'",
@@ -242,12 +221,83 @@ MIGRATIONS = [
 async def init_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(INIT_SQL)
+        # 1. Авто-миграция: старая схема (users.login_enc)
+        old_schema = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'users' AND column_name = 'login_enc'
+            )
+        """)
+        if old_schema:
+            log.warning("Old schema detected (users.login_enc). Dropping tables...")
+            try:
+                await conn.execute("DROP TABLE IF EXISTS accounts CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS users CASCADE")
+            except Exception as e:
+                log.exception("Drop old tables failed: %s", e)
+
+        # 2. Создаём таблицы по одной
+        create_users = """
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id         BIGINT PRIMARY KEY,
+                notify_mode     TEXT    DEFAULT 'important',
+                schedule_start  INTEGER DEFAULT 0,
+                schedule_end    INTEGER DEFAULT 0,
+                created_at      BIGINT  DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )
+        """
+        create_accounts = """
+            CREATE TABLE IF NOT EXISTS accounts (
+                id            BIGSERIAL PRIMARY KEY,
+                chat_id       BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+                label         TEXT NOT NULL DEFAULT '',
+                login_enc     BYTEA NOT NULL,
+                password_enc  BYTEA NOT NULL,
+                token_enc     BYTEA,
+                raid_enabled  INTEGER DEFAULT 1,
+                pvp_enabled   INTEGER DEFAULT 1,
+                cata_enabled  INTEGER DEFAULT 1,
+                raid_loc      INTEGER DEFAULT 10,
+                cata_fixed    INTEGER DEFAULT 1,
+                cata_level    INTEGER DEFAULT 17,
+                cata_stars    INTEGER DEFAULT 1,
+                auto_start    INTEGER DEFAULT 0,
+                created_at    BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )
+        """
+        create_index = "CREATE INDEX IF NOT EXISTS idx_accounts_chat ON accounts(chat_id)"
+
+        for label, sql in [
+            ("users", create_users),
+            ("accounts", create_accounts),
+            ("idx_accounts_chat", create_index),
+        ]:
+            try:
+                await conn.execute(sql)
+                log.info("Table/idx ready: %s", label)
+            except Exception as e:
+                log.exception("Migration error on %s: %s", label, e)
+
+        # 3. Миграции новых столбцов
         for sql in MIGRATIONS:
             try:
                 await conn.execute(sql)
             except Exception:
                 pass
+
+        # 4. Проверка, что users существует
+        users_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'users'
+            )
+        """)
+        if not users_exists:
+            raise RuntimeError(
+                "CRITICAL: Table 'users' was not created. "
+                "Check DB user privileges and schema."
+            )
+
     safe = DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else "?"
     log.info("DB ready (Postgres @ %s)", safe)
 
@@ -256,14 +306,16 @@ async def ensure_user(chat_id: int):
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (chat_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            chat_id)
+            chat_id,
+        )
 
 async def get_user_prefs(chat_id: int) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT notify_mode, schedule_start, schedule_end FROM users WHERE chat_id=$1",
-            chat_id)
+            chat_id,
+        )
     if not row:
         return {"notify_mode": "important", "schedule_start": 0, "schedule_end": 0}
     return {
@@ -277,12 +329,15 @@ async def update_user_pref(chat_id: int, field: str, value):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE users SET {} = $1 WHERE chat_id=$2".format(field), value, chat_id)
+            "UPDATE users SET {} = $1 WHERE chat_id=$2".format(field),
+            value, chat_id,
+        )
 
 async def count_accounts(chat_id: int) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE chat_id=$1", chat_id)
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM accounts WHERE chat_id=$1", chat_id)
 
 async def add_account(chat_id: int, login: str, password: str, label: str):
     pool = await get_pool()
@@ -292,7 +347,8 @@ async def add_account(chat_id: int, login: str, password: str, label: str):
                VALUES ($1, $2, $3, $4) RETURNING id""",
             chat_id, label,
             fernet.encrypt(login.encode()),
-            fernet.encrypt(password.encode()))
+            fernet.encrypt(password.encode()),
+        )
     return row["id"] if row else None
 
 async def save_account_token(account_id: int, token: str):
@@ -300,7 +356,8 @@ async def save_account_token(account_id: int, token: str):
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE accounts SET token_enc=$1 WHERE id=$2",
-            fernet.encrypt(token.encode()), account_id)
+            fernet.encrypt(token.encode()), account_id,
+        )
 
 def _acc_from_row(row):
     if not row:
@@ -339,7 +396,8 @@ async def get_account(account_id: int):
 async def list_accounts(chat_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM accounts WHERE chat_id=$1 ORDER BY id", chat_id)
+        rows = await conn.fetch(
+            "SELECT * FROM accounts WHERE chat_id=$1 ORDER BY id", chat_id)
     out = []
     for r in rows:
         a = _acc_from_row(r)
@@ -357,7 +415,9 @@ async def update_account_flag(account_id: int, field: str, value):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE accounts SET {} = $1 WHERE id=$2".format(field), value, account_id)
+            "UPDATE accounts SET {} = $1 WHERE id=$2".format(field),
+            value, account_id,
+        )
 
 async def delete_account(account_id: int):
     pool = await get_pool()
@@ -402,8 +462,8 @@ def _extract_token(data, depth: int = 0):
             if t:
                 return t
         return None
-    for k in ("token", "access_token", "accessToken", "access", "jwt",
-              "auth_token", "authToken", "key", "id_token", "bearer"):
+    for k in ("token", "access_token", "accessToken", "access",
+              "jwt", "auth_token", "authToken", "key", "id_token", "bearer"):
         v = data.get(k)
         if isinstance(v, str) and len(v) > 20:
             return v
@@ -425,7 +485,8 @@ class RemangaClient:
         self.token = self._norm(token) if token else None
         self._c = httpx.AsyncClient(
             timeout=20,
-            headers={"User-Agent": ua_for(account_id), "Accept": "application/json"})
+            headers={"User-Agent": ua_for(account_id), "Accept": "application/json"},
+        )
 
     @staticmethod
     def _norm(t: str) -> str:
@@ -446,12 +507,14 @@ class RemangaClient:
                 API_DOMAIN + "/api/users/login/",
                 json={"user": login, "password": password},
                 headers={"Content-Type": "application/json",
-                         "User-Agent": ua, "Accept": "application/json"})
+                         "User-Agent": ua, "Accept": "application/json"},
+            )
             log.info("LOGIN status=%s len=%d", r.status_code, len(r.text or ""))
             if r.status_code != 200:
                 if r.status_code in (400, 401, 403):
                     raise RemangaAuthError("Неверный логин/пароль")
-                raise RemangaAuthError("Ошибка входа: HTTP {}".format(r.status_code))
+                raise RemangaAuthError(
+                    "Ошибка входа: HTTP {}".format(r.status_code))
             try:
                 data = r.json()
             except Exception:
@@ -530,24 +593,35 @@ class RemangaClient:
 
     async def profile(self):
         return await self._get("/api/v2/events/card-battle/profile/")
+
     async def eventpoint_balance(self):
         return await self._get("/api/v2/events/eventpoint-balance/")
+
     async def raid(self, loc: int):
-        return await self._post("/api/v2/events/card-battle/locations/{}/raid/".format(loc))
+        return await self._post(
+            "/api/v2/events/card-battle/locations/{}/raid/".format(loc))
+
     async def pvp(self):
         return await self._post("/api/v2/events/card-battle/pvp/match/")
+
     async def cata_state(self):
         return await self._get("/api/v2/events/card-battle/catacombs/state/")
+
     async def cata_levels(self):
         return await self._get("/api/v2/events/card-battle/catacombs/levels/")
+
     async def cata_enter(self, lvl, stars):
         return await self._post(
             "/api/v2/events/card-battle/catacombs/levels/{}/enter/".format(lvl),
-            {"stars": stars})
+            {"stars": stars},
+        )
+
     async def cata_resolve(self, aid):
         return await self._post(
             "/api/v2/events/card-battle/catacombs/mini-game/{}/resolve/".format(aid),
-            {"outcome": "won", "proof": {}})
+            {"outcome": "won", "proof": {}},
+        )
+
     async def buy_shop_item(self, item_id: int, amount: int = 1):
         if item_id in FORBIDDEN_SHOP_IDS:
             return 403, {"error": "forbidden"}
@@ -693,7 +767,8 @@ class AutoBattler:
                 limit = int(s.get("daily_limit", 0) or 0)
                 qty = int(s.get("quantity", 0) or 0)
                 mark = "✅" if used >= limit else "⏳"
-                return "{} Воскрешение: {}/{} (в наличии {})".format(mark, used, limit, qty)
+                return "{} Воскрешение: {}/{} (в наличии {})".format(
+                    mark, used, limit, qty)
         return "⏳ Воскрешение: нет данных"
 
     async def _ensure_stars(self, cli, need_stars: int) -> bool:
@@ -706,7 +781,8 @@ class AutoBattler:
             return True
         if cur >= MAX_STARS_AUTO_BUY:
             await self._emit(
-                "⛔ Звёзд {} ≥ {} — покупка отключена".format(cur, MAX_STARS_AUTO_BUY),
+                "⛔ Звёзд {} ≥ {} — покупка отключена".format(
+                    cur, MAX_STARS_AUTO_BUY),
                 important=False)
             return False
         buy_count = min(need_stars - cur, MAX_STARS_AUTO_BUY - cur)
@@ -719,7 +795,8 @@ class AutoBattler:
         need_pts = buy_count * SHOP_COST_EVENT_POINTS
         if pts < need_pts:
             await self._emit(
-                "⭐ Звёзд {}/{}, points {}/{}. Рейдим.".format(cur, need_stars, pts, need_pts),
+                "⭐ Звёзд {}/{}, points {}/{}. Рейдим.".format(
+                    cur, need_stars, pts, need_pts),
                 important=False)
             return False
         bought = 0
@@ -737,7 +814,8 @@ class AutoBattler:
             await asyncio.sleep(1.0)
         if bought > 0:
             await self._emit(
-                "⭐ Куплено {}★ за {} pts".format(bought, bought * SHOP_COST_EVENT_POINTS),
+                "⭐ Куплено {}★ за {} pts".format(
+                    bought, bought * SHOP_COST_EVENT_POINTS),
                 important=True)
         pa = await cli.profile() or {}
         return int(pa.get("awakening_energy", 0) or 0) >= need_stars
@@ -751,8 +829,11 @@ class AutoBattler:
         s_end = self._user_prefs.get("schedule_end", 0)
         sched_desc = fmt_schedule(s_start, s_end)
 
-        cata_desc = ("{}/{}★".format(self.flags.cata_level, self.flags.cata_stars)
-                     if self.flags.cata_fixed else "авто")
+        if self.flags.cata_fixed:
+            cata_desc = "{}/{}★".format(self.flags.cata_level, self.flags.cata_stars)
+        else:
+            cata_desc = "авто"
+
         await self._emit(
             "🟢 Запущен\n"
             "⚔️ Рейд: {} (лок. {})\n"
@@ -780,7 +861,8 @@ class AutoBattler:
                     now = time.time()
                     profile = await cli.profile()
                     if isinstance(profile, dict) and profile.get("_server_down"):
-                        await self._emit("🌐 Сервер недоступен, жду 5 мин", important=False)
+                        await self._emit("🌐 Сервер недоступен, жду 5 мин",
+                                         important=False)
                         await asyncio.sleep(SERVER_DOWN_RETRY)
                         continue
                     profile = profile or {}
@@ -800,8 +882,12 @@ class AutoBattler:
                                 cfg = x
                                 break
                         if cfg:
-                            reserve = int(cfg.get("energy_cost", {}).get(str(self.flags.cata_stars), 0) or 0)
-                            need_stars_cata = int(cfg.get("awakening_energy_cost", {}).get(str(self.flags.cata_stars), 0) or 0)
+                            reserve = int(
+                                cfg.get("energy_cost", {})
+                                .get(str(self.flags.cata_stars), 0) or 0)
+                            need_stars_cata = int(
+                                cfg.get("awakening_energy_cost", {})
+                                .get(str(self.flags.cata_stars), 0) or 0)
 
                     s_start = self._user_prefs.get("schedule_start", 0)
                     s_end = self._user_prefs.get("schedule_end", 0)
@@ -811,9 +897,10 @@ class AutoBattler:
                     if self.flags.cata:
                         res_done = await self._resurrect_done(cli)
                     cata_open = self.flags.cata and in_win and not res_done
-                    next_sleep = BATTLE_LOOP_INTERVAL if cata_open else BATTLE_LOOP_INTERVAL_IDLE
+                    next_sleep = (BATTLE_LOOP_INTERVAL if cata_open
+                                  else BATTLE_LOOP_INTERVAL_IDLE)
 
-                    # Катакомбы
+                    # --- Катакомбы ---
                     stars_ok = True
                     if cata_open and stars < need_stars_cata:
                         stars_ok = await self._ensure_stars(cli, need_stars_cata)
@@ -821,14 +908,17 @@ class AutoBattler:
                         if not (isinstance(p2, dict) and p2.get("_server_down")):
                             stars = int(p2.get("awakening_energy", 0) or 0)
 
-                    if cata_open and stars_ok and energy >= reserve and stars >= need_stars_cata:
+                    if (cata_open and stars_ok and energy >= reserve
+                            and stars >= need_stars_cata):
                         await self._do_cata(cli)
                         await asyncio.sleep(BATTLE_LOOP_INTERVAL)
                         continue
 
-                    # Рейд
-                    cata_ready = cata_open and energy >= reserve and stars >= need_stars_cata
-                    if self.flags.raid and not cata_ready and now - last_raid >= self._raid_interval:
+                    # --- Рейд ---
+                    cata_ready = (cata_open and energy >= reserve
+                                  and stars >= need_stars_cata)
+                    if (self.flags.raid and not cata_ready
+                            and now - last_raid >= self._raid_interval):
                         last_raid = now
                         need_raid = raid_energy(self.flags.raid_loc)
                         if energy >= need_raid:
@@ -843,10 +933,11 @@ class AutoBattler:
                                     "{} x{}".format(r.get("kind"), r.get("amount"))
                                     for r in rewards if isinstance(r, dict)) or "ok"
                                 await self._emit(
-                                    "⚔️ Рейд {}: {}".format(self.flags.raid_loc, rtxt),
+                                    "⚔️ Рейд {}: {}".format(
+                                        self.flags.raid_loc, rtxt),
                                     important=False)
 
-                    # Сбор статуса
+                    # --- Сбор статуса ---
                     if now - last_status >= 300:
                         last_status = now
                         dust = int(profile.get("reroll_dust", 0) or 0)
@@ -869,8 +960,9 @@ class AutoBattler:
                         }
 
                 except RemangaAuthError:
-                    await self._emit("🔐 Токен истёк. Удалите и добавьте заново.",
-                                     important=True)
+                    await self._emit(
+                        "🔐 Токен истёк. Удалите и добавьте заново.",
+                        important=True)
                     break
                 except asyncio.CancelledError:
                     raise
@@ -891,20 +983,23 @@ class AutoBattler:
             return
         profile = profile or {}
 
-        pending = state.get("mini_game") or (state.get("current_run") or {}).get("mini_game")
+        pending = (state.get("mini_game")
+                   or (state.get("current_run") or {}).get("mini_game"))
         pid = (pending or {}).get("attempt_id") or state.get("attempt_id")
         if pid:
             att = self._mini_attempts.get(pid, 0)
             if att < MINI_GAME_MAX_ATTEMPTS:
                 code, resp = await cli.cata_resolve(pid)
-                if code == 200 and not (isinstance(resp, dict) and resp.get("_server_down")):
+                if code == 200 and not (
+                        isinstance(resp, dict) and resp.get("_server_down")):
                     self._mini_attempts.pop(pid, None)
                     await self._emit("🏺 Дорешана мини-игра", important=False)
                 else:
                     self._mini_attempts[pid] = att + 1
             else:
-                await self._emit("🚫 Мини-игра {} пропущена".format(pid),
-                                 important=True)
+                await self._emit(
+                    "🚫 Мини-игра {} пропущена".format(pid),
+                    important=True)
                 self._mini_attempts.pop(pid, None)
                 return
 
@@ -942,16 +1037,18 @@ class AutoBattler:
         cr = int(profile.get("full_reroll_energy", 0) or 0)
 
         if ce < ne or cs < ns or cr < nr:
-            await self._emit("⏸ {}/{}★: не хватает".format(lvl, stars),
-                             important=False)
+            await self._emit(
+                "⏸ {}/{}★: не хватает".format(lvl, stars),
+                important=False)
             return
 
         code, resp = await cli.cata_enter(lvl, stars)
         if isinstance(resp, dict) and resp.get("_server_down"):
             return
         if code != 200:
-            await self._emit("🏺 Катакомбы {}/{}★: ошибка {}".format(lvl, stars, code),
-                             important=True)
+            await self._emit(
+                "🏺 Катакомбы {}/{}★: ошибка {}".format(lvl, stars, code),
+                important=True)
             return
 
         kind = resp.get("kind")
@@ -959,7 +1056,8 @@ class AutoBattler:
             aid = (resp.get("mini_game") or {}).get("attempt_id") or resp.get("attempt_id")
             if aid:
                 code2, resp2 = await cli.cata_resolve(aid)
-                ok = (code2 == 200 and not (isinstance(resp2, dict) and resp2.get("_server_down")))
+                ok = (code2 == 200 and not (
+                    isinstance(resp2, dict) and resp2.get("_server_down")))
                 reward = "мини-игра пройдена" if ok else "мини-игра не решена"
             else:
                 reward = "мини-игра без ID"
@@ -998,7 +1096,8 @@ async def register_battler(account: dict, notify, user_prefs: dict):
             raid=account["raid_enabled"], pvp=account["pvp_enabled"],
             cata=account["cata_enabled"], raid_loc=account["raid_loc"],
             cata_fixed=account["cata_fixed"], cata_level=account["cata_level"],
-            cata_stars=account["cata_stars"])
+            cata_stars=account["cata_stars"],
+        )
         b = AutoBattler(account["id"], account["chat_id"], account["label"],
                         account["token"], notify, flags, user_prefs)
         _battlers[account["id"]] = b
@@ -1063,7 +1162,7 @@ async def _autostart_accounts(bot: Bot):
             log.exception("autostart failed acc=%s", a["id"])
 
 # ============================================================
-# ХЕНДЛЕРЫ
+# КЛАВИАТУРЫ
 # ============================================================
 router = Router()
 
@@ -1181,7 +1280,8 @@ def notify_menu_kb(current: str):
     kb = InlineKeyboardBuilder()
     for val, name in [("all", "Все"), ("important", "Только важные"), ("off", "Выкл")]:
         mark = "✅ " if val == current else "▫️ "
-        kb.button(text="{}{}".format(mark, name), callback_data="uset:notify:{}".format(val))
+        kb.button(text="{}{}".format(mark, name),
+                  callback_data="uset:notify:{}".format(val))
     kb.button(text="⬅️ Назад", callback_data="ctl:user_settings")
     kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
@@ -1205,7 +1305,9 @@ def _notify_for(bot: Bot, chat_id: int):
             await bot.send_message(chat_id, text)
     return notify
 
-# ---------- Команды ----------
+# ============================================================
+# КОМАНДЫ
+# ============================================================
 @router.message(Command("start"))
 async def cmd_start(m: Message):
     await ensure_user(m.chat.id)
@@ -1325,7 +1427,9 @@ async def cmd_notify(m: Message, command: CommandObject):
     await refresh_user_prefs(m.chat.id)
     await m.answer("✅ Уведомления: {}".format(mode))
 
-# ---------- Callbacks ----------
+# ============================================================
+# CALLBACKS
+# ============================================================
 @router.callback_query(F.data == "ctl:menu")
 async def cb_menu(cq: CallbackQuery):
     accounts = await list_accounts(cq.from_user.id)
@@ -1372,8 +1476,8 @@ async def cb_user_settings(cq: CallbackQuery):
 @router.callback_query(F.data == "uset:notify_menu")
 async def cb_notify_menu(cq: CallbackQuery):
     prefs = await get_user_prefs(cq.from_user.id)
-    await cq.message.edit_text("🔔 Уведомления:",
-                                reply_markup=notify_menu_kb(prefs["notify_mode"]))
+    await cq.message.edit_text(
+        "🔔 Уведомления:", reply_markup=notify_menu_kb(prefs["notify_mode"]))
     await cq.answer()
 
 @router.callback_query(F.data.startswith("uset:notify:"))
@@ -1385,8 +1489,8 @@ async def cb_notify_set(cq: CallbackQuery):
     await update_user_pref(cq.from_user.id, "notify_mode", mode)
     await refresh_user_prefs(cq.from_user.id)
     prefs = await get_user_prefs(cq.from_user.id)
-    await cq.message.edit_text("🔔 Уведомления:",
-                                reply_markup=notify_menu_kb(prefs["notify_mode"]))
+    await cq.message.edit_text(
+        "🔔 Уведомления:", reply_markup=notify_menu_kb(prefs["notify_mode"]))
     await cq.answer("Режим: {}".format(mode))
 
 @router.callback_query(F.data == "uset:sched_menu")
@@ -1498,8 +1602,8 @@ async def cb_acc_settings(cq: CallbackQuery):
     if not a or a["chat_id"] != cq.from_user.id:
         await cq.answer("Нет доступа", show_alert=True)
         return
-    await cq.message.edit_text("⚙️ «{}»:".format(a["label"]),
-                                reply_markup=settings_kb(a))
+    await cq.message.edit_text(
+        "⚙️ «{}»:".format(a["label"]), reply_markup=settings_kb(a))
     await cq.answer()
 
 @router.callback_query(F.data.startswith("acc:profile:"))
@@ -1523,7 +1627,10 @@ async def cb_acc_profile(cq: CallbackQuery):
     finally:
         await cli.close()
     stars = int(p.get("awakening_energy", 0) or 0)
-    buy_note = "⛔ ≥ {}".format(MAX_STARS_AUTO_BUY) if stars >= MAX_STARS_AUTO_BUY else "до {}".format(MAX_STARS_AUTO_BUY)
+    if stars >= MAX_STARS_AUTO_BUY:
+        buy_note = "⛔ ≥ {}".format(MAX_STARS_AUTO_BUY)
+    else:
+        buy_note = "до {}".format(MAX_STARS_AUTO_BUY)
     await cq.message.edit_text(
         "👤 <b>{}</b>\n"
         "⚡ {}/{}\n"
@@ -1572,8 +1679,8 @@ async def cb_toggle(cq: CallbackQuery):
     if was_running:
         prefs = await get_user_prefs(cq.from_user.id)
         await register_battler(a, _notify_for(cq.bot, cq.from_user.id), prefs)
-    await cq.message.edit_text("⚙️ «{}»:".format(a["label"]),
-                                reply_markup=settings_kb(a))
+    await cq.message.edit_text(
+        "⚙️ «{}»:".format(a["label"]), reply_markup=settings_kb(a))
     await cq.answer("Обновлено")
 
 @router.callback_query(F.data.startswith("raidloc:"))
@@ -1587,8 +1694,8 @@ async def cb_raidloc(cq: CallbackQuery):
     if not a or a["chat_id"] != cq.from_user.id:
         await cq.answer("Нет доступа", show_alert=True)
         return
-    await cq.message.edit_text("📍 Локация:",
-                                reply_markup=raid_loc_kb(aid, a["raid_loc"]))
+    await cq.message.edit_text(
+        "📍 Локация:", reply_markup=raid_loc_kb(aid, a["raid_loc"]))
     await cq.answer()
 
 @router.callback_query(F.data.startswith("raidloc:set:"))
@@ -1601,8 +1708,8 @@ async def cb_raidloc_set(cq: CallbackQuery):
         return
     await update_account_flag(aid, "raid_loc", loc)
     a = await get_account(aid)
-    await cq.message.edit_text("⚙️ «{}»:".format(a["label"]),
-                                reply_markup=settings_kb(a))
+    await cq.message.edit_text(
+        "⚙️ «{}»:".format(a["label"]), reply_markup=settings_kb(a))
     await cq.answer("Локация {}".format(loc))
 
 @router.callback_query(F.data.startswith("cata:menu:"))
@@ -1638,8 +1745,9 @@ async def cb_cata_lvl(cq: CallbackQuery):
     if not a or a["chat_id"] != cq.from_user.id:
         await cq.answer("Нет доступа", show_alert=True)
         return
-    await cq.message.edit_text("📍 Уровень (1–25):",
-                                reply_markup=cata_lvl_kb(aid, a["cata_level"]))
+    await cq.message.edit_text(
+        "📍 Уровень (1–25):",
+        reply_markup=cata_lvl_kb(aid, a["cata_level"]))
     await cq.answer()
 
 @router.callback_query(F.data.startswith("cata:setlvl:"))
@@ -1658,8 +1766,8 @@ async def cb_cata_stars(cq: CallbackQuery):
     if not a or a["chat_id"] != cq.from_user.id:
         await cq.answer("Нет доступа", show_alert=True)
         return
-    await cq.message.edit_text("⭐ Сложность:",
-                                reply_markup=cata_stars_kb(aid, a["cata_stars"]))
+    await cq.message.edit_text(
+        "⭐ Сложность:", reply_markup=cata_stars_kb(aid, a["cata_stars"]))
     await cq.answer()
 
 @router.callback_query(F.data.startswith("cata:setstars:"))
@@ -1692,9 +1800,12 @@ def make_bot() -> Bot:
     conn = TCPConnector(family=socket.AF_INET)
     sess = AiohttpSession()
     sess._connector = conn
-    return Bot(token=BOT_TOKEN,
-               default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-               session=sess, timeout=120)
+    return Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=sess,
+        timeout=120,
+    )
 
 async def main():
     await init_db()
