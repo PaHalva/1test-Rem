@@ -1,5 +1,5 @@
 # ============================================================
-# Remanga AutoBattle Telegram Bot — multi-account edition v4
+# Remanga AutoBattle Telegram Bot — multi-account edition v6
 # Совместимо с Python 3.11
 # ============================================================
 
@@ -221,7 +221,6 @@ MIGRATIONS = [
 async def init_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 1. Авто-миграция: старая схема (users.login_enc)
         old_schema = await conn.fetchval("""
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.columns
@@ -236,7 +235,6 @@ async def init_db():
             except Exception as e:
                 log.exception("Drop old tables failed: %s", e)
 
-        # 2. Создаём таблицы по одной
         create_users = """
             CREATE TABLE IF NOT EXISTS users (
                 chat_id         BIGINT PRIMARY KEY,
@@ -278,14 +276,12 @@ async def init_db():
             except Exception as e:
                 log.exception("Migration error on %s: %s", label, e)
 
-        # 3. Миграции новых столбцов
         for sql in MIGRATIONS:
             try:
                 await conn.execute(sql)
             except Exception:
                 pass
 
-        # 4. Проверка, что users существует
         users_exists = await conn.fetchval("""
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.tables
@@ -1316,7 +1312,7 @@ async def cmd_start(m: Message):
     if not accounts:
         await m.answer(
             "👋 <b>Remanga AutoBattle Bot</b>\n\n"
-            "У вас нет аккаунтов.\n"
+            "У вас нет аккаунтов.\n\n"
             "Добавьте: <code>/add логин пароль [метка]</code>")
         return
     await m.answer(
@@ -1428,8 +1424,13 @@ async def cmd_notify(m: Message, command: CommandObject):
     await m.answer("✅ Уведомления: {}".format(mode))
 
 # ============================================================
-# CALLBACKS
+# CALLBACKS — ВАЖЕН ПОРЯДОК!
+# Специфичные фильтры (raidloc:set:, cata:setlvl:, cata:setstars:)
+# объявляются РАНЬШЕ общих (raidloc:, cata:lvl:, cata:stars:).
 # ============================================================
+
+# ---------- Общие ----------
+
 @router.callback_query(F.data == "ctl:menu")
 async def cb_menu(cq: CallbackQuery):
     accounts = await list_accounts(cq.from_user.id)
@@ -1662,6 +1663,8 @@ async def cb_acc_del(cq: CallbackQuery):
     await cq.answer("Удалён")
     await cb_menu(cq)
 
+# ---------- Переключатели флагов ----------
+
 @router.callback_query(F.data.startswith("tgl:"))
 async def cb_toggle(cq: CallbackQuery):
     _, aid_s, field = cq.data.split(":", 2)
@@ -1683,13 +1686,44 @@ async def cb_toggle(cq: CallbackQuery):
         "⚙️ «{}»:".format(a["label"]), reply_markup=settings_kb(a))
     await cq.answer("Обновлено")
 
+# ---------- Локация рейда ----------
+# ВАЖНО: сначала "set", потом общий
+
+@router.callback_query(F.data.startswith("raidloc:set:"))
+async def cb_raidloc_set(cq: CallbackQuery):
+    parts = cq.data.split(":")
+    if len(parts) < 4:
+        await cq.answer("Некорректно")
+        return
+    try:
+        aid = int(parts[2])
+        loc = int(parts[3])
+    except ValueError:
+        await cq.answer("Некорректно")
+        return
+    a = await get_account(aid)
+    if not a or a["chat_id"] != cq.from_user.id:
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+    if not (1 <= loc <= 10):
+        await cq.answer("Некорректная локация")
+        return
+    await update_account_flag(aid, "raid_loc", loc)
+    a = await get_account(aid)
+    await cq.message.edit_text(
+        "⚙️ «{}»:".format(a["label"]), reply_markup=settings_kb(a))
+    await cq.answer("Локация {}".format(loc))
+
 @router.callback_query(F.data.startswith("raidloc:"))
 async def cb_raidloc(cq: CallbackQuery):
     parts = cq.data.split(":")
-    if len(parts) < 2:
-        await cq.answer("Некорректно")
+    # Пропускаем "set" — его ловит cb_raidloc_set выше
+    if len(parts) < 2 or parts[1] == "set":
         return
-    aid = int(parts[1])
+    try:
+        aid = int(parts[1])
+    except ValueError:
+        return
     a = await get_account(aid)
     if not a or a["chat_id"] != cq.from_user.id:
         await cq.answer("Нет доступа", show_alert=True)
@@ -1698,19 +1732,7 @@ async def cb_raidloc(cq: CallbackQuery):
         "📍 Локация:", reply_markup=raid_loc_kb(aid, a["raid_loc"]))
     await cq.answer()
 
-@router.callback_query(F.data.startswith("raidloc:set:"))
-async def cb_raidloc_set(cq: CallbackQuery):
-    _, _, aid_s, loc_s = cq.data.split(":")
-    aid, loc = int(aid_s), int(loc_s)
-    a = await get_account(aid)
-    if not a or a["chat_id"] != cq.from_user.id:
-        await cq.answer("Нет доступа", show_alert=True)
-        return
-    await update_account_flag(aid, "raid_loc", loc)
-    a = await get_account(aid)
-    await cq.message.edit_text(
-        "⚙️ «{}»:".format(a["label"]), reply_markup=settings_kb(a))
-    await cq.answer("Локация {}".format(loc))
+# ---------- Катакомбы ----------
 
 @router.callback_query(F.data.startswith("cata:menu:"))
 async def cb_cata_menu(cq: CallbackQuery):
@@ -1738,6 +1760,26 @@ async def cb_cata_fixed(cq: CallbackQuery):
     await cq.message.edit_text("🏺 Катакомбы:", reply_markup=cata_menu_kb(a))
     await cq.answer("Фикс.")
 
+@router.callback_query(F.data.startswith("cata:setlvl:"))
+async def cb_cata_setlvl(cq: CallbackQuery):
+    parts = cq.data.split(":")
+    if len(parts) < 4:
+        await cq.answer("Некорректно")
+        return
+    try:
+        aid = int(parts[2])
+        lvl = int(parts[3])
+    except ValueError:
+        await cq.answer("Некорректно")
+        return
+    if not (1 <= lvl <= 25):
+        await cq.answer("Некорректный уровень")
+        return
+    await update_account_flag(aid, "cata_level", lvl)
+    a = await get_account(aid)
+    await cq.message.edit_text("🏺 Катакомбы:", reply_markup=cata_menu_kb(a))
+    await cq.answer("Уровень {}".format(lvl))
+
 @router.callback_query(F.data.startswith("cata:lvl:"))
 async def cb_cata_lvl(cq: CallbackQuery):
     aid = int(cq.data.split(":")[2])
@@ -1750,14 +1792,25 @@ async def cb_cata_lvl(cq: CallbackQuery):
         reply_markup=cata_lvl_kb(aid, a["cata_level"]))
     await cq.answer()
 
-@router.callback_query(F.data.startswith("cata:setlvl:"))
-async def cb_cata_setlvl(cq: CallbackQuery):
-    _, _, aid_s, lvl_s = cq.data.split(":")
-    aid, lvl = int(aid_s), int(lvl_s)
-    await update_account_flag(aid, "cata_level", lvl)
+@router.callback_query(F.data.startswith("cata:setstars:"))
+async def cb_cata_setstars(cq: CallbackQuery):
+    parts = cq.data.split(":")
+    if len(parts) < 4:
+        await cq.answer("Некорректно")
+        return
+    try:
+        aid = int(parts[2])
+        s = int(parts[3])
+    except ValueError:
+        await cq.answer("Некорректно")
+        return
+    if not (1 <= s <= 5):
+        await cq.answer("Некорректная сложность")
+        return
+    await update_account_flag(aid, "cata_stars", s)
     a = await get_account(aid)
     await cq.message.edit_text("🏺 Катакомбы:", reply_markup=cata_menu_kb(a))
-    await cq.answer("Уровень {}".format(lvl))
+    await cq.answer("{}★".format(s))
 
 @router.callback_query(F.data.startswith("cata:stars:"))
 async def cb_cata_stars(cq: CallbackQuery):
@@ -1769,15 +1822,6 @@ async def cb_cata_stars(cq: CallbackQuery):
     await cq.message.edit_text(
         "⭐ Сложность:", reply_markup=cata_stars_kb(aid, a["cata_stars"]))
     await cq.answer()
-
-@router.callback_query(F.data.startswith("cata:setstars:"))
-async def cb_cata_setstars(cq: CallbackQuery):
-    _, _, aid_s, s_s = cq.data.split(":")
-    aid, s = int(aid_s), int(s_s)
-    await update_account_flag(aid, "cata_stars", s)
-    a = await get_account(aid)
-    await cq.message.edit_text("🏺 Катакомбы:", reply_markup=cata_menu_kb(a))
-    await cq.answer("{}★".format(s))
 
 # ============================================================
 # HEALTH + ЗАПУСК
